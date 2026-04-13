@@ -85,93 +85,41 @@ def _final_generation_prefix() -> torch.Tensor:
 
 
 
-def svara_text_to_tokens(
+def simple_text_to_tokens(
     text: str,
-    speaker_id: Optional[str],
-    audio_tokens: Optional[List[int]] = None,
-    transcript: Optional[str] = None,
     tokenizer = None,
     return_decoded: bool = False,
 ) -> Union[List[int], str]:
     """
-    Build Svara-TTS prompt for:
-      - Standard TTS (speaker_id + text)
-      - Zero-shot TTS (audio reference only)
-      - Zero-shot TTS (audio reference + transcript)
+    Build simple prompt for NeuCodec-based TTS model.
+    Just tokenizes the text directly without complex formatting.
 
     Args:
         text: Target text to synthesize.
-        speaker_id: Speaker identifier (e.g., "Hindi (Male)"). Required for standard TTS.
-        audio_tokens: SNAC token sequence from reference audio (WITH offsets).
-        transcript: Optional transcript of the reference audio.
         tokenizer: Tokenizer used to convert text to IDs.
         return_decoded: 
-            - False (default): return List[int] of token IDs (for `prompt_token_ids` style usage).
-            - True: return decoded string prompt (for OpenAI-compatible HTTP APIs that expect text).
+            - False (default): return List[int] of token IDs.
+            - True: return decoded string prompt.
 
     Returns:
         List[int] if return_decoded=False
         str      if return_decoded=True
     """
     if tokenizer is None:
-        raise ValueError("tokenizer is required for svara_text_to_tokens")
+        raise ValueError("tokenizer is required for simple_text_to_tokens")
     if not isinstance(text, str):
         raise ValueError("text must be a string")
 
-    blocks: List[torch.Tensor] = [BOS_ID]
-
-    # ---------------------------------------------------------------------
-    # ZERO-SHOT PATH (audio_tokens is provided)
-    # ---------------------------------------------------------------------
-    if audio_tokens is not None:
-        audio_tokens_tensor = torch.tensor([audio_tokens], dtype=torch.int64)
-
-        # (a) Optional reference transcript as a human turn
-        if transcript and isinstance(transcript, str) and transcript.strip():
-            transcript_ids = tokenizer(
-                transcript,
-                return_tensors="pt",
-                add_special_tokens=False,
-            ).input_ids
-            blocks.append(_human_turn(transcript_ids))
-
-        # (b) Reference audio as an AI turn
-        blocks.append(_audio_turn(audio_tokens_tensor))
-
-        # (c) Target text as human turn + final AI speech start
-        target_ids = tokenizer(
-            text,
-            return_tensors="pt",
-            add_special_tokens=False,
-        ).input_ids
-        blocks.append(_human_turn(target_ids))
-        blocks.append(_final_generation_prefix())
-
-    # ---------------------------------------------------------------------
-    # STANDARD TTS PATH (no audio_tokens)
-    # ---------------------------------------------------------------------
-    else:
-        if speaker_id is None:
-            raise ValueError("speaker_id is required for standard TTS")
-
-        prompt = f"{speaker_id}: {text}"
-        text_ids = tokenizer(
-            prompt,
-            return_tensors="pt",
-            add_special_tokens=False,
-        ).input_ids
-
-        # Single human turn, then start AI speech
-        blocks.append(_human_turn(text_ids))
-        blocks.append(_final_generation_prefix())
-
-    # ---------------------------------------------------------------------
-    # Concatenate all blocks
-    # ---------------------------------------------------------------------
-    full_input_ids = torch.cat(blocks, dim=1).view(-1)
+    # Simple tokenization - just convert text to token IDs
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        add_special_tokens=True,  # Add BOS and other special tokens
+    )
+    
+    input_ids = inputs.input_ids.view(-1).tolist()
 
     if return_decoded:
-        # Keep special tokens, since your prompt format depends on them.
-        return tokenizer.decode(full_input_ids.tolist(), skip_special_tokens=False)
+        return tokenizer.decode(input_ids, skip_special_tokens=False)
 
-    return full_input_ids.tolist()
+    return input_ids

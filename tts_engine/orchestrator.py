@@ -7,9 +7,9 @@ import asyncio
 import logging
 import torch
 from .transports import VLLMEmbeddedTransport
-from .mapper import SvaraMapper, extract_custom_token_numbers
-from .codec import SNACCodec, get_or_load_tokenizer
-from .encoder import svara_text_to_tokens
+from .mapper import NeuCodecMapper, extract_codebook_token_numbers
+from .codec import NeuCodecWrapper, get_or_load_tokenizer
+from .encoder import simple_text_to_tokens
 from .utils import create_speaker_id
 from .buffers import AudioBuffer, SyncFuture, crossfade_pcm
 from .utils import chunk_text
@@ -17,24 +17,24 @@ from .utils import chunk_text
 logger = logging.getLogger(__name__)
 
 
-def _detect_max_workers(snac_device: Optional[str] = None) -> int:
+def _detect_max_workers(device: Optional[str] = None) -> int:
     """
-    Detect recommended max_workers for SNAC decoding.
+    Detect recommended max_workers for NeuCodec decoding.
 
-    When SNAC runs on CPU, scale with available CPU cores.
-    When SNAC runs on GPU, limit workers to avoid GPU contention.
+    When NeuCodec runs on CPU, scale with available CPU cores.
+    When NeuCodec runs on GPU, limit workers to avoid GPU contention.
     """
     import os
 
-    # If SNAC is on CPU, use half the CPU cores (minimum 2)
-    device = snac_device or os.getenv("SNAC_DEVICE", "cpu")
+    # If NeuCodec is on CPU, use half the CPU cores (minimum 2)
+    device = device or os.getenv("DEVICE", "cpu")
     if device == "cpu":
         cpu_count = os.cpu_count() or 4
         workers = max(2, cpu_count // 2)
-        logger.info(f"SNAC on CPU: {cpu_count} cores available, using {workers} workers")
+        logger.info(f"NeuCodec on CPU: {cpu_count} cores available, using {workers} workers")
         return workers
 
-    # SNAC on GPU — keep workers limited to avoid contention
+    # NeuCodec on GPU — keep workers limited to avoid contention
     if torch.cuda.is_available():
         try:
             props = torch.cuda.get_device_properties(0)
@@ -47,78 +47,57 @@ def _detect_max_workers(snac_device: Optional[str] = None) -> int:
     return 2
 
 
-class SvaraTTSOrchestrator:
+class NeuCodecTTSOrchestrator:
     """
-    Sync/Async TTS orchestrator:
+    Sync/Async TTS orchestrator for NeuCodec-based models:
     transport -> mapper -> decoder -> PCM int16 chunks.
 
     Args:
         transport: The VLLMEmbeddedTransport instance.
         model: The model name (for tokenizer lookup).
-        speaker_id: The speaker identifier (e.g., "Hindi (Male)", "English (Female)").
-                    If not provided, will be constructed from lang_code and gender.
-        lang_code: An ISO 639-1 language code (used if speaker_id not provided).
-        gender: The gender of the voice (used if speaker_id not provided).
         prebuffer_seconds: The number of seconds to prebuffer before yielding audio.
         concurrent_decode: If True, decode concurrently.
         max_workers: The number of workers to use for decoding (None = auto-detect).
-        snac_window_size: SNAC mapper window size in codes. Must be multiple of 7.
-                          28 = 4 frames (default, fast TTFB), 56 = 8 frames (fewer
-                          decode calls, better throughput). Set via SNAC_WINDOW_SIZE env var.
-        device: Device for SNAC decoder (cuda, mps, cpu, or None for auto).
+        buffer_size: Number of tokens to buffer before decoding (default 100).
+        device: Device for NeuCodec decoder (cuda, mps, cpu, or None for auto).
     """
     def __init__(self,
                  transport: VLLMEmbeddedTransport,
-                 model: str = "kenpath/svara-tts-v1",
-                 speaker_id: Optional[str] = None,
-                 lang_code: str = "en",
-                 gender: Literal["male", "female"] = "male",
+                 model: str = "kenpath/qwen3.5-0.8b-stage5",
                  prebuffer_seconds: float = 0.5,
                  concurrent_decode: bool = True,
                  max_workers: Optional[int] = None,
-                 snac_window_size: Optional[int] = None,
+                 buffer_size: int = 100,
                  device: Optional[str] = None):
-        # If speaker_id is provided, use it; otherwise construct from lang_code and gender
-        if speaker_id is None:
-            self.speaker_id = create_speaker_id(lang_code, gender)
-        else:
-            self.speaker_id = speaker_id
 
         self.model_name = model
-        self.tokenizer_model = os.getenv("TOKENIZER_MODEL", os.getenv("VLLM_MODEL", "kenpath/svara-tts-v1"))
+        self.tokenizer_model = os.getenv("TOKENIZER_MODEL", os.getenv("VLLM_MODEL", "kenpath/qwen3.5-0.8b-stage5"))
         self.tokenizer      = get_or_load_tokenizer(self.tokenizer_model)
 
         self.transport      = transport
-        self.codec      = SNACCodec(device)
+        self.codec      = NeuCodecWrapper(device)
         self.prebuffer_samples = int(self.codec.sample_rate * prebuffer_seconds)
         self.concurrent_decode = concurrent_decode
 
-        # Auto-detect optimal workers based on SNAC device
+        # Auto-detect optimal workers based on device
         self.max_workers = max_workers if max_workers is not None else _detect_max_workers(device)
 
-        # SNAC window size: configurable via constructor or env var
-        if snac_window_size is not None:
-            self.snac_window_size = snac_window_size
-        else:
-            self.snac_window_size = int(os.getenv("SNAC_WINDOW_SIZE", "28"))
+        # Token buffer size
+        self.buffer_size = buffer_size
 
         # Long-text chunking config
-        # Each SNAC frame = 7 tokens ≈ 10ms audio. With max_tokens=2048,
-        # the model can produce ~292 frames ≈ 3s of speech. At ~15 chars/s
-        # speaking rate, that's ~45 chars. Use 200 chars for safety margin
-        # and to allow for varying speech rates across languages.
         self.max_chunk_chars = 200
         self.crossfade_ms = 50         # Crossfade overlap between chunks
 
         logger.info(f"Orchestrator: max_workers={self.max_workers}, "
-                     f"snac_window_size={self.snac_window_size}, "
+                     f"buffer_size={self.buffer_size}, "
                      f"prebuffer={prebuffer_seconds}s")
 
     def warmup(self):
-        """Run a dummy SNAC decode to trigger torch.compile and warm caches."""
-        logger.info("Warming up SNAC decoder...")
-        self.codec.decode_window([1] * self.snac_window_size)
-        logger.info("SNAC warmup complete")
+        """Run a dummy NeuCodec decode to warm caches."""
+        logger.info("Warming up NeuCodec decoder...")
+        self.codec.decode_tokens([1] * self.buffer_size)
+        logger.info("NeuCodec warmup complete")
 
     # ------------ SYNC path ------------
     def stream(self,
@@ -197,11 +176,8 @@ class SvaraTTSOrchestrator:
                     prebuffer_samples: Optional[int] = None,
                     **gen_kwargs) -> Iterator[bytes]:
 
-        prompt = svara_text_to_tokens(
+        prompt = simple_text_to_tokens(
             text=text,
-            speaker_id=speaker_id or self.speaker_id,
-            audio_tokens=audio_reference,
-            transcript=reference_text,
             tokenizer=self.tokenizer,
             return_decoded=True
         )
@@ -209,23 +185,23 @@ class SvaraTTSOrchestrator:
         logger.info(f"Final prompt before inference: {len(prompt)} chars")
         logger.debug(f"Full prompt: {prompt}")
 
-        mapper = SvaraMapper(window_size=self.snac_window_size)
+        mapper = NeuCodecMapper(buffer_size=self.buffer_size)
         audio_buf = AudioBuffer(prebuffer_samples if prebuffer_samples is not None else self.prebuffer_samples)
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) if self.concurrent_decode else None
         pending: List[concurrent.futures.Future] = []
 
-        def decode(win: List[int]) -> bytes:
-            return self.codec.decode_window(win)
+        def decode(tokens: List[int]) -> bytes:
+            return self.codec.decode_tokens(tokens)
 
-        def submit(win: List[int]):
-            return executor.submit(decode, win) if executor else SyncFuture(decode(win))
+        def submit(tokens: List[int]):
+            return executor.submit(decode, tokens) if executor else SyncFuture(decode(tokens))
 
         try:
             for token_text in self.transport.stream(prompt, **gen_kwargs):
-                for n in extract_custom_token_numbers(token_text):
-                    win = mapper.feed_raw(n)
-                    if win is not None:
-                        pending.append(submit(win))
+                for n in extract_codebook_token_numbers(token_text):
+                    tokens = mapper.feed_raw(n)
+                    if tokens is not None:
+                        pending.append(submit(tokens))
 
                     # Yield when we have enough pending
                     while len(pending) > 2:
@@ -236,6 +212,14 @@ class SvaraTTSOrchestrator:
             # Flush remaining
             for fut in pending:
                 result = audio_buf.process(fut.result())
+                if result:
+                    yield result
+
+            # Flush any remaining tokens from mapper
+            remaining_tokens = mapper.flush()
+            if remaining_tokens:
+                final_audio = decode(remaining_tokens)
+                result = audio_buf.process(final_audio)
                 if result:
                     yield result
 
@@ -333,11 +317,8 @@ class SvaraTTSOrchestrator:
                            prebuffer_samples: Optional[int] = None,
                            **gen_kwargs) -> AsyncIterator[bytes]:
 
-        prompt = svara_text_to_tokens(
+        prompt = simple_text_to_tokens(
             text=text,
-            speaker_id=speaker_id or self.speaker_id,
-            audio_tokens=audio_reference,
-            transcript=reference_text,
             tokenizer=self.tokenizer,
             return_decoded=True
         )
@@ -345,27 +326,27 @@ class SvaraTTSOrchestrator:
         logger.info(f"Final prompt before inference: {len(prompt)} chars")
         logger.debug(f"Full prompt: {prompt}")
 
-        mapper = SvaraMapper(window_size=self.snac_window_size)
+        mapper = NeuCodecMapper(buffer_size=self.buffer_size)
         audio_buf = AudioBuffer(prebuffer_samples if prebuffer_samples is not None else self.prebuffer_samples)
         loop = asyncio.get_running_loop()
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) if self.concurrent_decode else None
         pending: List[asyncio.Task] = []
 
-        def decode(win: List[int]) -> bytes:
-            return self.codec.decode_window(win)
+        def decode(tokens: List[int]) -> bytes:
+            return self.codec.decode_tokens(tokens)
 
-        async def submit_async(win: List[int]) -> bytes:
+        async def submit_async(tokens: List[int]) -> bytes:
             if executor:
-                return await loop.run_in_executor(executor, decode, win)
+                return await loop.run_in_executor(executor, decode, tokens)
             else:
-                return decode(win)
+                return decode(tokens)
 
         try:
             async for token_text in self.transport.astream(prompt, **gen_kwargs):
-                for n in extract_custom_token_numbers(token_text):
-                    win = mapper.feed_raw(n)
-                    if win is not None:
-                        pending.append(asyncio.create_task(submit_async(win)))
+                for n in extract_codebook_token_numbers(token_text):
+                    tokens = mapper.feed_raw(n)
+                    if tokens is not None:
+                        pending.append(asyncio.create_task(submit_async(tokens)))
 
                     # Yield when we have enough pending
                     while len(pending) > 2:
@@ -376,6 +357,14 @@ class SvaraTTSOrchestrator:
             # Flush remaining
             for task in pending:
                 result = audio_buf.process(await task)
+                if result:
+                    yield result
+
+            # Flush any remaining tokens from mapper
+            remaining_tokens = mapper.flush()
+            if remaining_tokens:
+                final_audio = decode(remaining_tokens)
+                result = audio_buf.process(final_audio)
                 if result:
                     yield result
 

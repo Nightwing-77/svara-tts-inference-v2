@@ -1,9 +1,10 @@
 langcodes
 language_data
-snac
+neucodec
 torch
 torchaudio
 transformers>=4.30.0
+accelerate
 vllm>=0.17.0
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
@@ -12,4 +13,6 @@ python-dotenv
 flashinfer-python>=0.2.3
 hf-transfer  # Optional: faster HuggingFace downloads
 pyyaml
-torchcodec
+soundfile
+numpy
+huggingface_hub
