@@ -43,7 +43,7 @@ class VLLMEmbeddedTransport:
         # Import vLLM components
         from vllm import SamplingParams
         
-        # For Qwen3.5 text-only model, use direct model loading to avoid multimodal detection
+        # Use simple vLLM initialization without multimodal parameters
         try:
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -59,31 +59,16 @@ class VLLMEmbeddedTransport:
                 enforce_eager=enforce_eager,
                 attention_backend=attention_backend,
                 kv_cache_dtype=kv_cache_dtype,
-                # Disable multimodal features
-                disable_mm_backend=True,
-                tokenizer_mode="auto",
             )
             
             cls._engine = AsyncLLMEngine.from_engine_args(engine_args)
+            logger.info("vLLM engine initialized successfully")
             
         except Exception as e:
-            logger.error(f"Failed to initialize vLLM with AsyncEngineArgs: {e}")
-            logger.info("Trying alternative initialization method...")
-            
-            # Fallback: try direct engine creation
-            try:
-                cls._engine = AsyncLLMEngine.from_engine_args(
-                    model=model,
-                    tokenizer=model,
-                    trust_remote_code=trust_remote_code,
-                    dtype=dtype,
-                    gpu_memory_utilization=gpu_memory_utilization,
-                    max_model_len=max_model_len,
-                )
-                logger.info("Successfully initialized with fallback method")
-            except Exception as e2:
-                logger.error(f"Fallback initialization also failed: {e2}")
-                raise e2
+            logger.error(f"Failed to initialize vLLM: {e}")
+            logger.info("This is expected for Qwen3.5 models with this vLLM version.")
+            logger.info("Please use simple_server.py instead for direct model loading.")
+            raise e
         logger.info(f"vLLM engine initialized: model={model}, dtype={dtype}, "
                      f"quantization={quantization}, max_model_len={max_model_len}")
 
