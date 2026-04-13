@@ -36,10 +36,10 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from tts_engine.voice_config import get_all_voices, get_speaker_id
-from tts_engine.orchestrator import SvaraTTSOrchestrator
+from tts_engine.orchestrator import NeuCodecTTSOrchestrator
 from tts_engine.transports import VLLMEmbeddedTransport
 from tts_engine.utils import load_audio_from_bytes
-from tts_engine.codec import SNACCodec
+from tts_engine.codec import NeuCodecWrapper
 from api.models import VoiceResponse, VoicesResponse, OpenAISpeechRequest
 
 
@@ -47,8 +47,8 @@ from api.models import VoiceResponse, VoicesResponse, OpenAISpeechRequest
 # Configuration
 # ============================================================================
 
-VLLM_MODEL = os.getenv("VLLM_MODEL", "kenpath/svara-tts-v1")
-SNAC_DEVICE = os.getenv("SNAC_DEVICE", None)  # None = auto-detect (CUDA/MPS/CPU). Device for SNAC audio decoder.
+VLLM_MODEL = os.getenv("VLLM_MODEL", "kenpath/qwen3.5-0.8b-stage5")
+DEVICE = os.getenv("DEVICE", None)  # None = auto-detect (CUDA/MPS/CPU). Device for NeuCodec audio decoder.
 VLLM_GPU_MEMORY_UTILIZATION = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.9"))
 VLLM_MAX_MODEL_LEN = int(os.getenv("VLLM_MAX_MODEL_LEN", "4096"))
 VLLM_TENSOR_PARALLEL_SIZE = int(os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1"))
@@ -60,7 +60,7 @@ VLLM_KV_CACHE_DTYPE = os.getenv("VLLM_KV_CACHE_DTYPE", "auto")
 # HF_TOKEN is checked in codec.get_or_load_tokenizer() for private models
 
 # Global instances (initialized in lifespan)
-orchestrator: Optional[SvaraTTSOrchestrator] = None
+orchestrator: Optional[NeuCodecTTSOrchestrator] = None
 
 
 # ============================================================================
@@ -75,7 +75,7 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing Svara TTS API...")
     logger.info(f"  vLLM:  model={VLLM_MODEL}, dtype={VLLM_DTYPE}, quantization={VLLM_QUANTIZATION or 'none'}")
     logger.info(f"  vLLM:  max_model_len={VLLM_MAX_MODEL_LEN}, gpu_mem={VLLM_GPU_MEMORY_UTILIZATION}, tp={VLLM_TENSOR_PARALLEL_SIZE}, enforce_eager={VLLM_ENFORCE_EAGER}")
-    logger.info(f"  SNAC:  device={SNAC_DEVICE or 'auto-detect'}, window_size={os.getenv('SNAC_WINDOW_SIZE', '28')}")
+    logger.info(f"  NeuCodec: device={DEVICE or 'auto-detect'}, buffer_size={os.getenv('NEUCODEC_BUFFER_SIZE', '100')}")
     logger.info(f"  API:   host={os.getenv('API_HOST', '0.0.0.0')}, port={os.getenv('API_PORT', '8080')}, log_level={os.getenv('LOG_LEVEL', 'INFO')}")
     logger.info(f"  Auth:  HF_TOKEN={'set' if os.getenv('HF_TOKEN') else 'not set'}")
 
@@ -96,16 +96,16 @@ async def lifespan(app: FastAPI):
     transport = VLLMEmbeddedTransport(model=VLLM_MODEL)
 
     # Initialize orchestrator with default settings
-    orchestrator = SvaraTTSOrchestrator(
+    orchestrator = NeuCodecTTSOrchestrator(
         transport=transport,
         model=VLLM_MODEL,
-        speaker_id="English (Male)",  # Default, will be overridden per request
-        device=SNAC_DEVICE,
+        device=DEVICE,
         prebuffer_seconds=0.5,
         concurrent_decode=True,
+        buffer_size=int(os.getenv('NEUCODEC_BUFFER_SIZE', '100')),
     )
 
-    logger.info(f"Orchestrator initialized (workers={orchestrator.max_workers}, prebuffer={0.5}s, chunk_size={orchestrator.max_chunk_chars})")
+    logger.info(f"Orchestrator initialized (workers={orchestrator.max_workers}, prebuffer={0.5}s, buffer_size={orchestrator.buffer_size})")
     logger.info(f"Loaded {len(get_all_voices())} voices")
 
     orchestrator.warmup()
@@ -281,26 +281,9 @@ async def openai_speech(req: OpenAISpeechRequest):
     - Streaming and non-streaming responses
     - Multiple audio formats (mp3, opus, aac, wav, pcm)
     """
-    # Resolve voice: try voice_id lookup first, then treat as direct speaker name
-    speaker_id = None
-    if not req.reference_audio:
-        try:
-            speaker_id = get_speaker_id(req.voice)
-        except ValueError:
-            # Maybe it's already a speaker name like "Hindi (Male)"
-            # Pass it through and let the orchestrator handle it
-            speaker_id = req.voice
-
-    # Zero-shot voice cloning
+    # NeuCodec model doesn't use voice profiles or cloning - just use text directly
     audio_tokens = None
-    if req.reference_audio:
-        logger.info(f"Loading reference audio from bytes ({len(req.reference_audio)} bytes)")
-        audio_tensor, sample_rate = load_audio_from_bytes(req.reference_audio, device=SNAC_DEVICE)
-        logger.info(f"Audio loaded: shape={audio_tensor.shape}, sr={sample_rate}Hz")
-
-        codec = SNACCodec(device=SNAC_DEVICE)
-        audio_tokens = codec.encode_audio(audio_tensor, input_sample_rate=sample_rate, add_token_offsets=True)
-        logger.info(f"Audio tokens encoded: {len(audio_tokens)} tokens")
+    reference_text = None
 
     # Build generation kwargs
     gen_kwargs = {}
@@ -329,8 +312,7 @@ async def openai_speech(req: OpenAISpeechRequest):
     pcm_generator = orchestrator.astream(
         text=req.input,
         audio_reference=audio_tokens,
-        reference_text=req.reference_transcript,
-        speaker_id=speaker_id,
+        reference_text=reference_text,
         chunk_size=req.chunk_size,
         buffer_ms=req.buffer_ms,
         **gen_kwargs,
