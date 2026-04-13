@@ -59,7 +59,7 @@ class SimpleTTSEngine:
     def __init__(self):
         self.model_name = MODEL_NAME
         self.device = DEVICE
-        self.codec = NeuCodec.from_pretrained("neuphonic/neucodec").to(self.device)
+        # Codec will be loaded in initialize() method after model is loaded
         
     def initialize(self):
         """Initialize model and tokenizer."""
@@ -75,7 +75,7 @@ class SimpleTTSEngine:
             login(token=hf_token)
             logger.info("Logged in to HuggingFace")
         
-        # Load tokenizer and model
+        # Load tokenizer and model (exactly like your working code)
         tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
@@ -83,6 +83,10 @@ class SimpleTTSEngine:
             device_map="auto",
             trust_remote_code=True
         ).eval()
+        
+        # Load NeuCodec and move to model device
+        self.codec = NeuCodec.from_pretrained("neuphonic/neucodec")
+        self.codec = self.codec.to(model.device)
         
         logger.info("Model and tokenizer loaded successfully")
         
@@ -119,9 +123,13 @@ class SimpleTTSEngine:
         
         logger.info(f"Generated {len(ids)} codebook tokens")
         
-        # Convert to tensor and decode audio
-        codec_tokens = torch.tensor(ids, dtype=torch.long).to(self.device)
-        codec_tokens = codec_tokens.unsqueeze(0).unsqueeze(1)
+        # Convert to tensor and decode audio (exactly like your working code)
+        codec_tokens = torch.tensor(ids, dtype=torch.long).to(model.device)
+        print("Total tokens:", len(codec_tokens))
+        
+        codec_tokens = codec_tokens.unsqueeze(0)
+        codec_tokens = codec_tokens.unsqueeze(1)
+        print("Final shape:", codec_tokens.shape)
         
         with torch.no_grad():
             audio = self.codec.decode_code(codec_tokens)
