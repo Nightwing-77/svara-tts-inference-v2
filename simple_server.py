@@ -29,6 +29,7 @@ logging.basicConfig(
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 import torch
 import numpy as np
 import soundfile as sf
@@ -146,12 +147,6 @@ tts_engine = SimpleTTSEngine()
 # FastAPI Server
 # ============================================================================
 
-app = FastAPI(
-    title="NeuCodec Qwen TTS API",
-    description="Simple TTS API using NeuCodec Qwen model",
-    version="1.0.0"
-)
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup resources."""
@@ -160,20 +155,31 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down NeuCodec Qwen TTS API...")
 
+app = FastAPI(
+    title="NeuCodec Qwen TTS API",
+    description="Simple TTS API using NeuCodec Qwen model",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
     return {"status": "healthy", "model": MODEL_NAME}
 
+class SpeechRequest(BaseModel):
+    input: str
+    response_format: str = "wav"
+
 @app.post("/v1/audio/speech")
-async def speech_endpoint(request: dict):
+async def speech_endpoint(request: SpeechRequest):
     """Generate speech from text."""
     try:
-        text = request.get("input", "")
+        text = request.input
         if not text:
             raise HTTPException(status_code=400, detail="Input text is required")
         
-        response_format = request.get("response_format", "wav")
+        response_format = request.response_format
         
         logger.info(f"Generating speech for: {text[:50]}...")
         
@@ -209,4 +215,4 @@ if __name__ == "__main__":
     port = int(os.getenv("API_PORT", "8080"))
     
     logger.info(f"Starting server on {host}:{port}")
-    uvicorn.run(app, host=host, port=port, lifespan=lifespan)
+    uvicorn.run(app, host=host, port=port)
