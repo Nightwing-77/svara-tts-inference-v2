@@ -1,17 +1,15 @@
+#!/usr/bin/env python3
 """
-FastAPI server for Svara TTS API.
+FastAPI server for NeuCodec Qwen TTS using direct model loading.
+"""
 
-Provides OpenAI-compatible text-to-speech endpoints with support for
-Indian language voices and streaming audio generation.
-"""
 from __future__ import annotations
 import os
-import sys
+import re
 import logging
+import base64
 from pathlib import Path
-from typing import Optional, AsyncGenerator
 from contextlib import asynccontextmanager
-import asyncio
 
 try:
     from dotenv import load_dotenv
@@ -19,7 +17,6 @@ try:
 except ImportError:
     pass
 
-# Configure logging from LOG_LEVEL env var
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="[%(asctime)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s",
@@ -27,346 +24,272 @@ logging.basicConfig(
 )
 
 from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import StreamingResponse
-
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
+import torch
+import time
+import numpy as np
+import soundfile as sf
+import io
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from neucodec import NeuCodec
 
 logger = logging.getLogger(__name__)
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
+MODEL_NAME = os.getenv("VLLM_MODEL", "kenpath/qwen3.5-0.8b-stage5")
+DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+DEFAULT_SPEAKER_ID = os.getenv("SPEAKER_ID", "a1e51fd5")
 
-from tts_engine.voice_config import get_all_voices, get_speaker_id
-from tts_engine.orchestrator import NeuCodecTTSOrchestrator
-from tts_engine.transports import VLLMEmbeddedTransport
-from tts_engine.utils import load_audio_from_bytes
-from tts_engine.codec import NeuCodecWrapper
-from api.models import VoiceResponse, VoicesResponse, OpenAISpeechRequest
+# Global instances
+model = None
+tokenizer = None
+codec = None
+
+def initialize():
+    """Load model, tokenizer, and codec."""
+    global model, tokenizer, codec
+
+    logger.info(f"Loading model: {MODEL_NAME} on device: {DEVICE}")
+
+    hf_token = os.getenv("HF_TOKEN")
+    if hf_token:
+        from huggingface_hub import login
+        login(token=hf_token)
+        logger.info("Logged in to HuggingFace")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        trust_remote_code=True,
+    ).eval()
+
+    codec = NeuCodec.from_pretrained("neuphonic/neucodec")
+    codec = codec.to(model.device)
+
+    logger.info("Model, tokenizer, and codec loaded successfully")
 
 
-# ============================================================================
-# Configuration
-# ============================================================================
+def generate_tts(
+    text: str,
+    speaker_id: str = DEFAULT_SPEAKER_ID,
+    max_new_tokens: int = 2000,
+) -> bytes:
+    """Generate speech audio bytes from input text."""
+    if model is None or tokenizer is None or codec is None:
+        raise RuntimeError("Model not initialized")
 
-VLLM_MODEL = os.getenv("VLLM_MODEL", "kenpath/qwen3.5-0.8b-stage5")
-DEVICE = os.getenv("DEVICE", None)  # None = auto-detect (CUDA/MPS/CPU). Device for NeuCodec audio decoder.
-VLLM_GPU_MEMORY_UTILIZATION = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.9"))
-VLLM_MAX_MODEL_LEN = int(os.getenv("VLLM_MAX_MODEL_LEN", "4096"))
-VLLM_TENSOR_PARALLEL_SIZE = int(os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1"))
-VLLM_QUANTIZATION = os.getenv("VLLM_QUANTIZATION") or None
-VLLM_ENFORCE_EAGER = os.getenv("VLLM_ENFORCE_EAGER", "false").lower() in ("true", "1", "yes")
-VLLM_DTYPE = os.getenv("VLLM_DTYPE", "auto")
-VLLM_ATTENTION_BACKEND = os.getenv("VLLM_ATTENTION_BACKEND") or None
-VLLM_KV_CACHE_DTYPE = os.getenv("VLLM_KV_CACHE_DTYPE", "auto")
-# HF_TOKEN is checked in codec.get_or_load_tokenizer() for private models
+    formatted_text = (
+        f"<|tts|><tts_text_bos_single>{speaker_id}: "
+        f"{text}<tts_text_eod><|audio_start|>"
+    )
 
-# Global instances (initialized in lifespan)
-orchestrator: Optional[NeuCodecTTSOrchestrator] = None
+    inputs = tokenizer(formatted_text, return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=10,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            eos_token_id=[248071, 248044],
+        )
+
+    decoded = tokenizer.decode(output[0])
+    ids = list(map(int, re.findall(r"<\|codebook_(\d+)\|>", decoded)))
+
+    if not ids:
+        raise ValueError("No codec tokens generated. Check prompt or model.")
+
+    logger.info(f"Generated {len(ids)} codebook tokens")
+
+    codec_tokens = torch.tensor(ids, dtype=torch.long).to(model.device)
+    codec_tokens = codec_tokens.unsqueeze(0).unsqueeze(1)
+
+    with torch.no_grad():
+        audio = codec.decode_code(codec_tokens)
+
+    audio = audio.squeeze().cpu().numpy()
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, samplerate=24000, format="WAV")
+    buf.seek(0)
+    return buf.read()
 
 
-# ============================================================================
-# Application Lifecycle
-# ============================================================================
+def generate_tts_with_timing(
+    text: str,
+    speaker_id: str = DEFAULT_SPEAKER_ID,
+    max_new_tokens: int = 2000,
+) -> tuple[bytes, dict]:
+    """Generate speech with timing metrics (TTFB and total time)."""
+    if model is None or tokenizer is None or codec is None:
+        raise RuntimeError("Model not initialized")
+
+    metrics = {
+        "start_time": time.time(),
+        "ttfb_ms": None,
+        "total_time_ms": None,
+        "tokens_generated": 0,
+        "input_text": text,
+        "speaker_id": speaker_id,
+    }
+
+    formatted_text = (
+        f"<|tts|><tts_text_bos_single>{speaker_id}: "
+        f"{text}<tts_text_eod><|audio_start|>"
+    )
+
+    inputs = tokenizer(formatted_text, return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=10,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            eos_token_id=[248071, 248044],
+        )
+
+    first_token_time = time.time()
+    metrics["ttfb_ms"] = round((first_token_time - metrics["start_time"]) * 1000, 2)
+
+    decoded = tokenizer.decode(output[0])
+    ids = list(map(int, re.findall(r"<\|codebook_(\d+)\|>", decoded)))
+
+    if not ids:
+        raise ValueError("No codec tokens generated. Check prompt or model.")
+
+    metrics["tokens_generated"] = len(ids)
+
+    codec_tokens = torch.tensor(ids, dtype=torch.long).to(model.device)
+    codec_tokens = codec_tokens.unsqueeze(0).unsqueeze(1)
+
+    with torch.no_grad():
+        audio = codec.decode_code(codec_tokens)
+
+    audio = audio.squeeze().cpu().numpy()
+
+    buf = io.BytesIO()
+    sf.write(buf, audio, samplerate=24000, format="WAV")
+    buf.seek(0)
+    audio_bytes = buf.read()
+
+    metrics["total_time_ms"] = round((time.time() - metrics["start_time"]) * 1000, 2)
+
+    return audio_bytes, metrics
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize and cleanup resources."""
-    global orchestrator
-    
-    logger.info("Initializing Svara TTS API...")
-    logger.info(f"  vLLM:  model={VLLM_MODEL}, dtype={VLLM_DTYPE}, quantization={VLLM_QUANTIZATION or 'none'}")
-    logger.info(f"  vLLM:  max_model_len={VLLM_MAX_MODEL_LEN}, gpu_mem={VLLM_GPU_MEMORY_UTILIZATION}, tp={VLLM_TENSOR_PARALLEL_SIZE}, enforce_eager={VLLM_ENFORCE_EAGER}")
-    logger.info(f"  NeuCodec: device={DEVICE or 'auto-detect'}, buffer_size={os.getenv('NEUCODEC_BUFFER_SIZE', '100')}")
-    logger.info(f"  API:   host={os.getenv('API_HOST', '0.0.0.0')}, port={os.getenv('API_PORT', '8080')}, log_level={os.getenv('LOG_LEVEL', 'INFO')}")
-    logger.info(f"  Auth:  HF_TOKEN={'set' if os.getenv('HF_TOKEN') else 'not set'}")
-
-    # Initialize embedded vLLM engine (singleton)
-    VLLMEmbeddedTransport.initialize_engine(
-        model=VLLM_MODEL,
-        gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
-        max_model_len=VLLM_MAX_MODEL_LEN,
-        tensor_parallel_size=VLLM_TENSOR_PARALLEL_SIZE,
-        dtype=VLLM_DTYPE,
-        quantization=VLLM_QUANTIZATION,
-        enforce_eager=VLLM_ENFORCE_EAGER,
-        attention_backend=VLLM_ATTENTION_BACKEND,
-        kv_cache_dtype=VLLM_KV_CACHE_DTYPE,
-    )
-    logger.info("vLLM engine initialized (embedded)")
-
-    transport = VLLMEmbeddedTransport(model=VLLM_MODEL)
-
-    # Initialize orchestrator with default settings
-    orchestrator = NeuCodecTTSOrchestrator(
-        transport=transport,
-        model=VLLM_MODEL,
-        device=DEVICE,
-        prebuffer_seconds=0.5,
-        concurrent_decode=True,
-        buffer_size=int(os.getenv('NEUCODEC_BUFFER_SIZE', '100')),
-    )
-
-    logger.info(f"Orchestrator initialized (workers={orchestrator.max_workers}, prebuffer={0.5}s, buffer_size={orchestrator.buffer_size})")
-    logger.info(f"Loaded {len(get_all_voices())} voices")
-
-    orchestrator.warmup()
-    
+    logger.info("Starting NeuCodec Qwen TTS API...")
+    initialize()
     yield
-    
-    logger.info("Shutting down Svara TTS API...")
+    logger.info("Shutting down NeuCodec Qwen TTS API...")
 
-
-# ============================================================================
-# FastAPI Application
-# ============================================================================
 
 app = FastAPI(
-    title="Svara TTS API",
-    description="Text-to-speech API for Indian languages with streaming support",
+    title="NeuCodec Qwen TTS API",
+    description="TTS API using NeuCodec Qwen model",
     version="1.0.0",
     lifespan=lifespan,
 )
 
 
-# ============================================================================
-# Helpers
-# ============================================================================
-
-async def audio_stream_converter(
-    pcm_stream: AsyncGenerator[bytes, None],
-    format: str,
-    sample_rate: int = 24000,
-    channels: int = 1
-) -> AsyncGenerator[bytes, None]:
-    """
-    Convert PCM stream to target format using ffmpeg.
-    
-    Args:
-        pcm_stream: Async iterator yielding PCM bytes
-        format: Target format ('mp3', 'opus', 'aac', 'wav', 'pcm')
-        sample_rate: Input sample rate
-        channels: Input channels
-        
-    Yields:
-        Encoded audio bytes
-    """
-    if format == "pcm":
-        async for chunk in pcm_stream:
-            yield chunk
-        return
-
-    # Setup ffmpeg command
-    cmd = [
-        "ffmpeg",
-        "-f", "s16le",       # Input format: signed 16-bit little-endian
-        "-ar", str(sample_rate),
-        "-ac", str(channels),
-        "-i", "pipe:0",      # Read from stdin
-        "-loglevel", "error" # Suppress output
-    ]
-
-    # Format specific flags
-    if format == "mp3":
-        cmd.extend(["-f", "mp3", "pipe:1"])
-    elif format == "opus":
-        cmd.extend(["-f", "opus", "pipe:1"])
-    elif format == "aac":
-        cmd.extend(["-f", "adts", "pipe:1"]) # ADTS is streamable AAC container
-    elif format == "wav":
-        cmd.extend(["-f", "wav", "pipe:1"])
-    else:
-        # Fallback to PCM if unknown format
-        logger.warning(f"Unknown format '{format}', falling back to PCM")
-        async for chunk in pcm_stream:
-            yield chunk
-        return
-
-    # Start ffmpeg process
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    async def write_stdin():
-        try:
-            async for chunk in pcm_stream:
-                if process.stdin:
-                    process.stdin.write(chunk)
-                    await process.stdin.drain()
-            if process.stdin:
-                process.stdin.close()
-        except Exception as e:
-            logger.error(f"Error writing to ffmpeg stdin: {e}")
-            try:
-                process.kill()
-            except:
-                pass
-
-    # Create task to write to stdin
-    write_task = asyncio.create_task(write_stdin())
-
-    # Read from stdout
-    try:
-        if process.stdout:
-            while True:
-                chunk = await process.stdout.read(4096)
-                if not chunk:
-                    break
-                yield chunk
-    except Exception as e:
-        logger.error(f"Error reading from ffmpeg stdout: {e}")
-        raise
-    finally:
-        # Ensure process is cleaned up
-        if not write_task.done():
-            write_task.cancel()
-            try:
-                await write_task
-            except asyncio.CancelledError:
-                pass
-        
-        if process.returncode is None:
-            try:
-                process.kill()
-            except:
-                pass
-            await process.wait()
-
-
-# ============================================================================
-# Endpoints
-# ============================================================================
-
 @app.get("/health")
-async def health_check():
-    """Health check endpoint for container orchestration."""
-    return {
-        "status": "healthy",
-        "model": VLLM_MODEL,
-        "engine": "embedded",
-    }
+async def health():
+    return {"status": "healthy", "model": MODEL_NAME}
 
 
-@app.get("/v1/voices", response_model=VoicesResponse)
-async def get_voices(model_id: Optional[str] = None):
-    """
-    Get list of available voices.
-    
-    Args:
-        model_id: Optional filter by model ID (e.g., "svara-tts-v1")
-    
-    Returns:
-        List of available voices with metadata
-    """
-    voices = get_all_voices(model_id=model_id)
-    return VoicesResponse(
-        voices=[VoiceResponse(**voice.to_dict()) for voice in voices]
-    )
+class SpeechRequest(BaseModel):
+    input: str
+    speaker_id: str = DEFAULT_SPEAKER_ID
+    response_format: str = "wav"
+    max_new_tokens: int = 2000
 
 
 @app.post("/v1/audio/speech")
-async def openai_speech(req: OpenAISpeechRequest):
-    """
-    OpenAI-compatible text-to-speech endpoint.
+async def speech_endpoint(request: SpeechRequest):
+    if not request.input:
+        raise HTTPException(status_code=400, detail="Input text is required")
 
-    Drop-in replacement for OpenAI's /v1/audio/speech. Works with the OpenAI SDK
-    out of the box. Extended features (zero-shot cloning, generation params) can
-    be passed via the SDK's `extra_body` parameter.
+    logger.info(f"Generating speech for: {request.input[:80]}...")
 
-    Supports:
-    - Standard TTS with any available voice
-    - Zero-shot voice cloning via `reference_audio` (base64)
-    - Generation parameter tuning (temperature, top_p, etc.)
-    - Streaming and non-streaming responses
-    - Multiple audio formats (mp3, opus, aac, wav, pcm)
-    """
-    # NeuCodec model doesn't use voice profiles or cloning - just use text directly
-    audio_tokens = None
-    reference_text = None
+    try:
+        wav_bytes = generate_tts(
+            text=request.input,
+            speaker_id=request.speaker_id,
+            max_new_tokens=request.max_new_tokens,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error generating speech: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # Build generation kwargs
-    gen_kwargs = {}
-    if req.temperature is not None:
-        gen_kwargs["temperature"] = req.temperature
-    if req.top_p is not None:
-        gen_kwargs["top_p"] = req.top_p
-    if req.top_k is not None:
-        gen_kwargs["top_k"] = req.top_k
-    if req.repetition_penalty is not None:
-        gen_kwargs["repetition_penalty"] = req.repetition_penalty
-    if req.max_tokens is not None:
-        gen_kwargs["max_tokens"] = req.max_tokens
-
-    # Map format to media type
-    format_media_types = {
-        "mp3": "audio/mpeg",
-        "opus": "audio/ogg",
-        "aac": "audio/aac",
-        "wav": "audio/wav",
-        "pcm": "audio/pcm",
-    }
-    media_type = format_media_types.get(req.response_format, "audio/mpeg")
-
-    # Generate audio
-    pcm_generator = orchestrator.astream(
-        text=req.input,
-        audio_reference=audio_tokens,
-        reference_text=reference_text,
-        chunk_size=req.chunk_size,
-        buffer_ms=req.buffer_ms,
-        **gen_kwargs,
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={"Content-Disposition": "attachment; filename=speech.wav"},
     )
 
-    audio_stream = audio_stream_converter(
-        pcm_generator,
-        format=req.response_format,
-    )
 
-    if req.stream:
-        return StreamingResponse(
-            audio_stream,
-            media_type=media_type,
-            headers={
-                "Content-Type": media_type,
-                "X-Sample-Rate": "24000",
-                "X-Channels": "1",
-            }
+class MetricsResponse(BaseModel):
+    audio: str
+    metrics: dict
+
+
+@app.post("/v1/audio/speech/metrics")
+async def speech_metrics_endpoint(request: SpeechRequest):
+    """Generate speech and return with TTFB and timing metrics."""
+    if not request.input:
+        raise HTTPException(status_code=400, detail="Input text is required")
+
+    logger.info(f"Generating speech with metrics for: {request.input[:80]}...")
+
+    try:
+        wav_bytes, metrics = generate_tts_with_timing(
+            text=request.input,
+            speaker_id=request.speaker_id,
+            max_new_tokens=request.max_new_tokens,
         )
-    else:
-        audio_chunks = []
-        async for chunk in audio_stream:
-            audio_chunks.append(chunk)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error generating speech: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-        complete_audio = b"".join(audio_chunks)
+    audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
 
-        return Response(
-            content=complete_audio,
-            media_type=media_type,
-            headers={
-                "Content-Type": media_type,
-                "Content-Length": str(len(complete_audio)),
-            }
-        )
+    return JSONResponse({
+        "audio": audio_b64,
+        "metrics": metrics
+    })
 
 
-# ============================================================================
-# Main Entry Point (for local development only)
-# ============================================================================
+# Load demo HTML template on startup
+_TEMPLATE_DIR = Path(__file__).parent / "templates"
+_DEMO_HTML = (_TEMPLATE_DIR / "demo.html").read_text(encoding="utf-8")
+
+
+@app.get("/demo", response_class=HTMLResponse)
+async def demo_endpoint():
+    """Serve the TTS GUI demo page for inference benchmarking."""
+    return _DEMO_HTML
+
 
 if __name__ == "__main__":
     import uvicorn
-    
-    port = int(os.getenv("API_PORT", "8080"))
+
     host = os.getenv("API_HOST", "0.0.0.0")
-    
-    print(f"Starting Svara TTS API on {host}:{port}")
-    print("Note: For production, use supervisord to manage processes")
-    
-    uvicorn.run(
-        "server:app",
-        host=host,
-        port=port,
-        reload=False,
-        log_level="info",
-    )
+    port = int(os.getenv("API_PORT", "8080"))
+
+    logger.info(f"Starting server on {host}:{port}")
+    uvicorn.run(app, host=host, port=port)

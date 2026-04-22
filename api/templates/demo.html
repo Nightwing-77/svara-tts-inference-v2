@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Svara TTS - Inference Benchmark</title>
+    <style>
+        :root {
+            --primary: #00d4ff;
+            --primary-glow: rgba(0, 212, 255, 0.4);
+            --secondary: #7b2cbf;
+            --bg-dark: #0a0a0f;
+            --bg-card: rgba(20, 20, 30, 0.6);
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0b0;
+            --accent-cyan: #00f0ff;
+            --accent-purple: #a855f7;
+            --success: #10b981;
+            --error: #ef4444;
+            --glass-border: rgba(255, 255, 255, 0.08);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: 
+                radial-gradient(ellipse at top, rgba(123, 44, 191, 0.15) 0%, transparent 50%),
+                radial-gradient(ellipse at bottom, rgba(0, 212, 255, 0.1) 0%, transparent 50%),
+                linear-gradient(180deg, var(--bg-dark) 0%, #0f0f1a 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 24px;
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+
+        .container {
+            background: var(--bg-card);
+            backdrop-filter: blur(20px);
+            border-radius: 24px;
+            padding: 48px;
+            width: 100%;
+            max-width: 760px;
+            border: 1px solid var(--glass-border);
+            box-shadow: 
+                0 0 0 1px rgba(0, 0, 0, 0.2),
+                0 20px 60px rgba(0, 0, 0, 0.5),
+                0 0 100px rgba(0, 212, 255, 0.05);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .container::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, 
+                transparent, 
+                rgba(0, 212, 255, 0.5), 
+                rgba(123, 44, 191, 0.5), 
+                transparent
+            );
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .logo {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+
+        .logo-icon {
+            width: 44px;
+            height: 44px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            box-shadow: 0 8px 24px rgba(0, 212, 255, 0.3);
+        }
+
+        h1 {
+            font-size: 2.4rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--text-primary) 0%, var(--accent-cyan) 50%, var(--accent-purple) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -0.02em;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 1rem;
+            font-weight: 400;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .subtitle::before,
+        .subtitle::after {
+            content: '';
+            width: 32px;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, var(--glass-border), transparent);
+        }
+
+        .input-section {
+            margin-bottom: 24px;
+        }
+
+        .input-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 10px;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        label .icon {
+            font-size: 1rem;
+        }
+
+        textarea {
+            width: 100%;
+            padding: 18px 20px;
+            border: 1px solid var(--glass-border);
+            border-radius: 16px;
+            background: rgba(0, 0, 0, 0.3);
+            color: var(--text-primary);
+            font-size: 1.05rem;
+            resize: vertical;
+            min-height: 140px;
+            font-family: inherit;
+            transition: all 0.3s ease;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px var(--primary-glow);
+            background: rgba(0, 0, 0, 0.4);
+        }
+
+        textarea::placeholder {
+            color: #555;
+        }
+
+        .row {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 16px;
+        }
+
+        input[type="text"], input[type="number"] {
+            width: 100%;
+            padding: 14px 18px;
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            background: rgba(0, 0, 0, 0.3);
+            color: var(--text-primary);
+            font-size: 0.95rem;
+            transition: all 0.3s ease;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px var(--primary-glow);
+            background: rgba(0, 0, 0, 0.4);
+        }
+
+        .generate-btn {
+            width: 100%;
+            padding: 18px 32px;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            border: none;
+            border-radius: 16px;
+            color: #fff;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .generate-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s ease;
+        }
+
+        .generate-btn:hover:not(:disabled)::before {
+            left: 100%;
+        }
+
+        .generate-btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 40px rgba(0, 212, 255, 0.35);
+        }
+
+        .generate-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .generate-btn .btn-icon {
+            font-size: 1.2rem;
+        }
+
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-top: 32px;
+            opacity: 0;
+            transform: translateY(20px);
+            transition: all 0.5s ease;
+        }
+
+        .metrics.active {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .metric-card {
+            background: rgba(0, 0, 0, 0.25);
+            border-radius: 16px;
+            padding: 24px 16px;
+            text-align: center;
+            border: 1px solid var(--glass-border);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .metric-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            opacity: 0.5;
+        }
+
+        .metric-label {
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            margin-bottom: 10px;
+            font-weight: 500;
+        }
+
+        .metric-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--accent-cyan);
+            font-family: 'SF Mono', monospace;
+            text-shadow: 0 0 20px rgba(0, 240, 255, 0.3);
+        }
+
+        .metric-unit {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+
+        .audio-section {
+            margin-top: 32px;
+            padding: 24px;
+            background: rgba(0, 0, 0, 0.25);
+            border-radius: 16px;
+            border: 1px solid var(--glass-border);
+            opacity: 0;
+            transform: translateY(20px);
+            transition: all 0.5s ease;
+        }
+
+        .audio-section.active {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .audio-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 16px;
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        audio {
+            width: 100%;
+            height: 48px;
+            border-radius: 12px;
+            margin-bottom: 16px;
+        }
+
+        .audio-actions {
+            display: flex;
+            gap: 12px;
+        }
+
+        .download-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 20px;
+            background: rgba(0, 212, 255, 0.1);
+            border: 1px solid rgba(0, 212, 255, 0.3);
+            border-radius: 12px;
+            color: var(--accent-cyan);
+            text-decoration: none;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+
+        .download-btn:hover {
+            background: rgba(0, 212, 255, 0.2);
+            border-color: var(--accent-cyan);
+            box-shadow: 0 4px 20px rgba(0, 212, 255, 0.2);
+        }
+
+        .error {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: var(--error);
+            padding: 16px 20px;
+            border-radius: 12px;
+            margin-top: 24px;
+            display: none;
+            align-items: center;
+            gap: 10px;
+            font-size: 0.95rem;
+        }
+
+        .error.active {
+            display: flex;
+        }
+
+        .loading {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+            margin-top: 32px;
+            padding: 32px;
+        }
+
+        .loading.active {
+            display: flex;
+        }
+
+        .spinner-ring {
+            width: 56px;
+            height: 56px;
+            position: relative;
+        }
+
+        .spinner-ring::before,
+        .spinner-ring::after {
+            content: '';
+            position: absolute;
+            border-radius: 50%;
+        }
+
+        .spinner-ring::before {
+            width: 100%;
+            height: 100%;
+            border: 3px solid transparent;
+            border-top-color: var(--primary);
+            border-right-color: var(--secondary);
+            animation: spin 1s linear infinite;
+        }
+
+        .spinner-ring::after {
+            width: 70%;
+            height: 70%;
+            top: 15%;
+            left: 15%;
+            border: 3px solid transparent;
+            border-bottom-color: var(--accent-cyan);
+            border-left-color: var(--accent-purple);
+            animation: spin 1.5s linear infinite reverse;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .loading-text {
+            color: var(--text-secondary);
+            font-size: 1rem;
+        }
+
+        .loading-subtext {
+            color: #666;
+            font-size: 0.8rem;
+        }
+
+        .pulse {
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        @media (max-width: 640px) {
+            .container {
+                padding: 32px 24px;
+            }
+
+            h1 {
+                font-size: 1.8rem;
+            }
+
+            .row {
+                grid-template-columns: 1fr;
+            }
+
+            .metrics {
+                grid-template-columns: 1fr;
+                gap: 12px;
+            }
+
+            .metric-card {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                text-align: left;
+                padding: 16px 20px;
+            }
+
+            .metric-label {
+                margin-bottom: 0;
+            }
+
+            .metric-unit {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="logo">
+                <div class="logo-icon">🎙️</div>
+                <h1>Svara TTS</h1>
+            </div>
+            <p class="subtitle">Inference Benchmark Dashboard</p>
+        </div>
+
+        <div class="input-section">
+            <div class="input-group">
+                <label for="text">
+                    <span class="icon">✍️</span>
+                    Input Text
+                </label>
+                <textarea id="text" placeholder="Enter text to convert to speech..."></textarea>
+            </div>
+
+            <div class="row">
+                <div class="input-group">
+                    <label for="speaker">
+                        <span class="icon">👤</span>
+                        Speaker ID
+                    </label>
+                    <input type="text" id="speaker" value="a1e51fd5" placeholder="Speaker ID">
+                </div>
+                <div class="input-group">
+                    <label for="maxTokens">
+                        <span class="icon">⚙️</span>
+                        Max Tokens
+                    </label>
+                    <input type="number" id="maxTokens" value="2000" min="10" max="4000">
+                </div>
+            </div>
+        </div>
+
+        <button id="generateBtn" class="generate-btn" onclick="generate()">
+            <span class="btn-icon">✨</span>
+            Generate Speech
+        </button>
+
+        <div class="loading" id="loading">
+            <div class="spinner-ring"></div>
+            <div class="loading-text">Generating audio...</div>
+            <div class="loading-subtext">This may take a few moments</div>
+        </div>
+
+        <div class="error" id="error">
+            <span>⚠️</span>
+            <span id="errorText"></span>
+        </div>
+
+        <div class="metrics" id="metrics">
+            <div class="metric-card">
+                <div class="metric-label">Time to First Byte</div>
+                <div class="metric-value" id="ttfb">--</div>
+                <div class="metric-unit">milliseconds</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Total Time</div>
+                <div class="metric-value" id="totalTime">--</div>
+                <div class="metric-unit">milliseconds</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Tokens Generated</div>
+                <div class="metric-value" id="tokens">--</div>
+                <div class="metric-unit">codebook tokens</div>
+            </div>
+        </div>
+
+        <div class="audio-section" id="audioSection">
+            <div class="audio-header">
+                <span>🎵</span>
+                Generated Audio
+            </div>
+            <audio id="audioPlayer" controls></audio>
+            <div class="audio-actions">
+                <a id="downloadBtn" class="download-btn" download="speech.wav">
+                    <span>⬇️</span>
+                    Download WAV
+                </a>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function generate() {
+            const text = document.getElementById("text").value.trim();
+            const speaker = document.getElementById("speaker").value.trim();
+            const maxTokens = parseInt(document.getElementById("maxTokens").value);
+            const btn = document.getElementById("generateBtn");
+            const loading = document.getElementById("loading");
+            const error = document.getElementById("error");
+            const errorText = document.getElementById("errorText");
+            const metrics = document.getElementById("metrics");
+            const audioSection = document.getElementById("audioSection");
+
+            if (!text) {
+                errorText.textContent = "Please enter some text to synthesize";
+                error.classList.add("active");
+                return;
+            }
+
+            btn.disabled = true;
+            loading.classList.add("active");
+            error.classList.remove("active");
+            metrics.classList.remove("active");
+            audioSection.classList.remove("active");
+
+            try {
+                const response = await fetch("/v1/audio/speech/metrics", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        input: text,
+                        speaker_id: speaker,
+                        max_new_tokens: maxTokens
+                    })
+                });
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.detail || "Generation failed");
+                }
+
+                const data = await response.json();
+
+                document.getElementById("ttfb").textContent = data.metrics.ttfb_ms.toFixed(1);
+                document.getElementById("totalTime").textContent = data.metrics.total_time_ms.toFixed(1);
+                document.getElementById("tokens").textContent = data.metrics.tokens_generated;
+
+                metrics.classList.add("active");
+
+                const audioBlob = new Blob(
+                    [Uint8Array.from(atob(data.audio), c => c.charCodeAt(0))],
+                    { type: "audio/wav" }
+                );
+                const audioUrl = URL.createObjectURL(audioBlob);
+
+                const audioPlayer = document.getElementById("audioPlayer");
+                audioPlayer.src = audioUrl;
+
+                const downloadBtn = document.getElementById("downloadBtn");
+                downloadBtn.href = audioUrl;
+
+                audioSection.classList.add("active");
+
+            } catch (err) {
+                errorText.textContent = err.message;
+                error.classList.add("active");
+            } finally {
+                btn.disabled = false;
+                loading.classList.remove("active");
+            }
+        }
+
+        document.getElementById("text").addEventListener("keydown", (e) => {
+            if (e.ctrlKey && e.key === "Enter") {
+                generate();
+            }
+        });
+    </script>
+</body>
+</html>
