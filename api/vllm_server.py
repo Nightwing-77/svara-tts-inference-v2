@@ -118,38 +118,42 @@ def initialize():
     except Exception as e:
         logger.warning(f"Could not disable multimodal: {e}")
     
-    # Strategy 2: Override model architecture to generic LLM
+    # Strategy 2: Monkey-patch vLLM's config loading
     try:
         from transformers import AutoConfig
-        config = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
-        # Force architecture to be text-only
-        if hasattr(config, 'architectures'):
-            config.architectures = ['LlamaForCausalLM']  # Generic architecture vLLM supports well
-        if hasattr(config, 'model_type'):
-            original_model_type = config.model_type
-            config.model_type = 'llama'  # Override model type
-            logger.info(f"Overrode model_type from {original_model_type} to 'llama'")
-        # Save to temp and use that
-        import tempfile
-        temp_dir = tempfile.mkdtemp()
-        config.save_pretrained(temp_dir)
-        os.environ["VLLM_CONFIG_PATH"] = temp_dir
-        logger.info(f"Saved patched config to {temp_dir}")
+        import vllm.transformers_utils.config as vllm_config_module
+        
+        # Store original load_config
+        original_load_config = vllm_config_module.get_config
+        
+        def patched_load_config(model, **kwargs):
+            """Load config and patch Qwen3.5 -> Llama for vLLM compatibility"""
+            config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+            
+            # Check if this is a Qwen3.5 model that needs patching
+            if hasattr(config, 'model_type') and 'qwen3' in config.model_type.lower():
+                logger.info(f"Patching config: {config.model_type} -> llama")
+                if hasattr(config, 'architectures'):
+                    config.architectures = ['LlamaForCausalLM']
+                config.model_type = 'llama'
+                # Store original for reference
+                config._original_model_type = 'qwen3.5'
+            
+            return config
+        
+        # Apply monkey patch
+        vllm_config_module.get_config = patched_load_config
+        logger.info("Applied vLLM config loading patch")
     except Exception as e:
-        logger.warning(f"Could not override config: {e}")
+        logger.warning(f"Could not apply config monkey patch: {e}")
 
     # vLLM engine with all optimizations
     # - Flash Attention: enabled by default
     # - PagedAttention: enabled by default  
     # - CUDA Graphs: enabled unless VLLM_ENFORCE_EAGER=true
     
-    # Use temp config if we created one, otherwise use original model name
-    model_path = os.environ.get("VLLM_CONFIG_PATH", MODEL_NAME)
-    if model_path != MODEL_NAME:
-        logger.info(f"Using patched config from {model_path}")
-    
     llm_args = {
-        "model": model_path,
+        "model": MODEL_NAME,
         "tokenizer": MODEL_NAME,
         "dtype": dtype,
         "gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
