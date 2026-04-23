@@ -43,11 +43,29 @@ from vllm.lora.request import LoRARequest
 
 logger = logging.getLogger(__name__)
 
-# vLLM compatibility flags
+# vLLM compatibility flags - MUST BE SET BEFORE VLLM IMPORTS
 os.environ["VLLM_USE_V1"] = "0"  # Use v0 engine for better custom model support
 os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"  # Allow longer contexts
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"  # More compatible process spawn
 
 MODEL_NAME = os.getenv("VLLM_MODEL", "kenpath/qwen3.5-0.8b-stage5")
+
+# CRITICAL: Apply patches BEFORE importing vLLM modules
+# This prevents Qwen3.5 model class registration
+try:
+    # Pre-patch: Remove Qwen3.5 from multimodal registry before it's imported
+    import sys
+    
+    # Create a fake empty module to prevent Qwen3.5 model loading
+    class FakeModule:
+        pass
+    
+    # Pre-emptively block Qwen3.5 models
+    sys.modules['vllm.model_executor.models.qwen3_5'] = FakeModule()
+    logger.info("Pre-blocked qwen3_5 module loading")
+except Exception as e:
+    logger.warning(f"Could not pre-patch: {e}")
+
 DEFAULT_SPEAKER_ID = os.getenv("SPEAKER_ID", "a1e51fd5")
 
 # vLLM specific configuration
@@ -118,34 +136,46 @@ def initialize():
     except Exception as e:
         logger.warning(f"Could not disable multimodal: {e}")
     
-    # Strategy 2: Monkey-patch vLLM's config loading
+    # Strategy 2: Aggressive patch for vLLM Qwen3.5 model compatibility
     try:
+        # Patch 2a: Override vLLM's config loading
         from transformers import AutoConfig
         import vllm.transformers_utils.config as vllm_config_module
         
-        # Store original load_config
         original_load_config = vllm_config_module.get_config
         
         def patched_load_config(model, **kwargs):
-            """Load config and patch Qwen3.5 -> Llama for vLLM compatibility"""
             config = AutoConfig.from_pretrained(model, trust_remote_code=True)
-            
-            # Check if this is a Qwen3.5 model that needs patching
             if hasattr(config, 'model_type') and 'qwen3' in config.model_type.lower():
                 logger.info(f"Patching config: {config.model_type} -> llama")
                 if hasattr(config, 'architectures'):
                     config.architectures = ['LlamaForCausalLM']
                 config.model_type = 'llama'
-                # Store original for reference
                 config._original_model_type = 'qwen3.5'
-            
             return config
         
-        # Apply monkey patch
         vllm_config_module.get_config = patched_load_config
         logger.info("Applied vLLM config loading patch")
+        
+        # Patch 2b: Remove Qwen3.5 from model registry to force Llama fallback
+        from vllm.model_executor.models import ModelRegistry
+        
+        # Unregister Qwen3.5 models to force generic handling
+        models_to_remove = []
+        for key in list(ModelRegistry._model_mapping.keys()):
+            if 'qwen3' in key.lower():
+                models_to_remove.append(key)
+        
+        for key in models_to_remove:
+            del ModelRegistry._model_mapping[key]
+            logger.info(f"Removed {key} from ModelRegistry")
+        
+        logger.info("Applied ModelRegistry patch")
+        
     except Exception as e:
-        logger.warning(f"Could not apply config monkey patch: {e}")
+        logger.warning(f"Could not apply config patches: {e}")
+        import traceback
+        logger.warning(traceback.format_exc())
 
     # vLLM engine with all optimizations
     # - Flash Attention: enabled by default
