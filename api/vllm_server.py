@@ -102,6 +102,14 @@ def initialize():
     # Determine optimal dtype
     dtype = get_optimal_dtype()
 
+    # Determine device for vLLM
+    if torch.cuda.is_available():
+        device = "cuda"
+        logger.info("Using CUDA device for vLLM")
+    else:
+        device = "cpu"
+        logger.info("Using CPU device for vLLM (slow)")
+
     # vLLM engine with all optimizations
     # - Flash Attention: enabled by default
     # - PagedAttention: enabled by default  
@@ -110,11 +118,12 @@ def initialize():
         "model": MODEL_NAME,
         "tokenizer": MODEL_NAME,
         "dtype": dtype,
-        "gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
+        "device": device,  # Explicit device to fix "Device string must not be empty" error
+        "gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION if device == "cuda" else 0.0,
         "max_model_len": VLLM_MAX_MODEL_LEN,
-        "tensor_parallel_size": VLLM_TENSOR_PARALLEL_SIZE,
+        "tensor_parallel_size": VLLM_TENSOR_PARALLEL_SIZE if device == "cuda" else 1,
         "trust_remote_code": True,
-        "enforce_eager": VLLM_ENFORCE_EAGER,  # False = use CUDA graphs
+        "enforce_eager": VLLM_ENFORCE_EAGER if device == "cuda" else True,  # CPU needs eager
         "enable_lora": False,
     }
 
@@ -134,8 +143,8 @@ def initialize():
     # Load NeuCodec
     codec = NeuCodec.from_pretrained("neuphonic/neucodec")
     
-    # Optimize codec for CUDA
-    if torch.cuda.is_available():
+    # Optimize codec for device
+    if device == "cuda":
         codec = codec.cuda()
         # Enable TF32 for faster matmuls on Ampere+
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -151,10 +160,12 @@ def initialize():
             )
         except Exception as e:
             logger.warning(f"Could not compile codec (requires PyTorch 2.0+): {e}")
+    else:
+        codec = codec.cpu()
 
     # Initialize thread pool for concurrent audio decoding
     global decoder_executor
-    decoder_workers = MAX_DECODER_WORKERS if torch.cuda.is_available() else (os.cpu_count() or 4)
+    decoder_workers = MAX_DECODER_WORKERS if device == "cuda" else min(4, os.cpu_count() or 4)
     decoder_executor = ThreadPoolExecutor(max_workers=decoder_workers)
     logger.info(f"Decoder thread pool: {decoder_workers} workers")
 
