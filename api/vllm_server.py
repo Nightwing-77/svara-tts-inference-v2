@@ -44,7 +44,6 @@ from vllm.lora.request import LoRARequest
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = os.getenv("VLLM_MODEL", "kenpath/qwen3.5-0.8b-stage5")
-DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 DEFAULT_SPEAKER_ID = os.getenv("SPEAKER_ID", "a1e51fd5")
 
 # vLLM specific configuration
@@ -64,6 +63,7 @@ llm: LLM | None = None
 tokenizer = None
 codec = None
 decoder_executor: ThreadPoolExecutor | None = None
+device: str = "cuda"  # Will be set in initialize()
 
 
 def get_optimal_dtype():
@@ -84,7 +84,7 @@ def get_optimal_dtype():
 
 def initialize():
     """Load vLLM engine, tokenizer, and codec with optimizations."""
-    global llm, tokenizer, codec
+    global llm, tokenizer, codec, decoder_executor, device
 
     logger.info(f"Loading vLLM engine with model: {MODEL_NAME}")
     logger.info(f"GPU Memory Utilization: {VLLM_GPU_MEMORY_UTILIZATION}")
@@ -102,14 +102,6 @@ def initialize():
     # Determine optimal dtype
     dtype = get_optimal_dtype()
 
-    # Determine device for vLLM
-    if torch.cuda.is_available():
-        device = "cuda"
-        logger.info("Using CUDA device for vLLM")
-    else:
-        device = "cpu"
-        logger.info("Using CPU device for vLLM (slow)")
-
     # vLLM engine with all optimizations
     # - Flash Attention: enabled by default
     # - PagedAttention: enabled by default  
@@ -118,12 +110,11 @@ def initialize():
         "model": MODEL_NAME,
         "tokenizer": MODEL_NAME,
         "dtype": dtype,
-        "device": device,  # Explicit device to fix "Device string must not be empty" error
-        "gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION if device == "cuda" else 0.0,
+        "gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
         "max_model_len": VLLM_MAX_MODEL_LEN,
-        "tensor_parallel_size": VLLM_TENSOR_PARALLEL_SIZE if device == "cuda" else 1,
+        "tensor_parallel_size": VLLM_TENSOR_PARALLEL_SIZE,
         "trust_remote_code": True,
-        "enforce_eager": VLLM_ENFORCE_EAGER if device == "cuda" else True,  # CPU needs eager
+        "enforce_eager": VLLM_ENFORCE_EAGER,
         "enable_lora": False,
     }
 
@@ -140,12 +131,13 @@ def initialize():
 
     llm = LLM(**llm_args)
 
-    # Load NeuCodec
+    # Load NeuCodec and move to same device as vLLM
     codec = NeuCodec.from_pretrained("neuphonic/neucodec")
     
-    # Optimize codec for device
-    if device == "cuda":
+    # Move codec to appropriate device
+    if torch.cuda.is_available():
         codec = codec.cuda()
+        device = "cuda"
         # Enable TF32 for faster matmuls on Ampere+
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -162,6 +154,7 @@ def initialize():
             logger.warning(f"Could not compile codec (requires PyTorch 2.0+): {e}")
     else:
         codec = codec.cpu()
+        device = "cpu"
 
     # Initialize thread pool for concurrent audio decoding
     global decoder_executor
@@ -170,7 +163,7 @@ def initialize():
     logger.info(f"Decoder thread pool: {decoder_workers} workers")
 
     logger.info("vLLM engine, tokenizer, and codec loaded successfully")
-    logger.info(f"Using device: {codec.device if hasattr(codec, 'device') else DEVICE}")
+    logger.info(f"Using device: {device}")
 
 
 def format_tts_prompt(text: str, speaker_id: str) -> str:
