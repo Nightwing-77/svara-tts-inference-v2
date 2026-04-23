@@ -29,33 +29,42 @@ logging.basicConfig(
 )
 
 # ---------------------------------------------------------------------------
-# CRITICAL: Apply vLLM patches at module load time — BEFORE any vLLM engine
-# is constructed. The problem is that vLLM's Qwen3_5ForCausalLM registers a
-# multimodal processor (shared with the VL variant). During processor init it
-# calls get_hf_config(Qwen3_5Config) which enforces an exact isinstance check,
-# but our TTS model returns Qwen3_5TextConfig (the text-only config class from
-# transformers), triggering:
-#   TypeError: Expected Qwen3_5Config, got Qwen3_5TextConfig
+# CRITICAL: Patch vLLM at module load time — before LLM(...) is ever called.
 #
-# We apply 4 layered patches so at least one hits the right code path
-# regardless of vLLM version.
+# Root cause chain:
+#   1. vLLM's Qwen3_5ForCausalLM registers a multimodal processor.
+#   2. The processor's get_hf_config(Qwen3_5Config) enforces isinstance.
+#   3. Our TTS model has Qwen3_5TextConfig (text-only), not Qwen3_5Config.
+#      → TypeError: Expected Qwen3_5Config, got Qwen3_5TextConfig
+#
+# Previous attempt returned None from create_processor, but vLLM V1 engine
+# then does: processor.info.supported_mm_limits  → AttributeError: NoneType
+#
+# Correct fix: patch ProcessingContext.get_hf_config to skip the strict
+# isinstance check so the processor builds successfully with our TextConfig.
+# That way create_processor returns a real processor object (not None) and
+# MultiModalBudget can use it safely.
 # ---------------------------------------------------------------------------
 def _apply_vllm_qwen35_patch():
     _log = logging.getLogger(__name__)
 
-    # Strategy 1: Patch ProcessingContext.get_hf_config — skip strict isinstance
+    # ------------------------------------------------------------------
+    # PRIMARY FIX: Patch ProcessingContext.get_hf_config to accept
+    # Qwen3_5TextConfig wherever Qwen3_5Config is expected.
+    # This is the root of the TypeError — fix it here so the processor
+    # builds successfully and downstream code gets a real object.
+    # ------------------------------------------------------------------
     try:
         from vllm.multimodal.processing import context as mm_context
-
-        original_ctx_get = mm_context.ProcessingContext.get_hf_config
 
         def patched_ctx_get_hf_config(self, config_cls=None):
             hf_config = self.model_config.hf_config
             if config_cls is None:
                 return hf_config
+            # Happy path: exact match
             if isinstance(hf_config, config_cls):
                 return hf_config
-            # Accept TextConfig / FullConfig mismatches (Qwen3_5TextConfig vs Qwen3_5Config)
+            # Qwen3_5TextConfig vs Qwen3_5Config mismatch — accept it.
             hf_name = type(hf_config).__name__
             cls_name = config_cls.__name__
             if (hf_name.replace("Text", "") == cls_name or
@@ -63,66 +72,83 @@ def _apply_vllm_qwen35_patch():
                     hf_name in cls_name or cls_name in hf_name):
                 _log.debug(f"Config coercion: {hf_name} accepted as {cls_name}")
                 return hf_config
+            # Last resort: return as-is and let downstream decide
             _log.warning(
                 f"Config type mismatch: expected {cls_name}, got {hf_name}. "
-                "Returning anyway."
+                "Returning anyway — downstream may fail."
             )
             return hf_config
 
         mm_context.ProcessingContext.get_hf_config = patched_ctx_get_hf_config
-        _log.info("Patch S1 applied: ProcessingContext.get_hf_config (no strict type check)")
+        _log.info("Patch PRIMARY applied: ProcessingContext.get_hf_config (no strict type check)")
     except Exception as e:
-        _log.warning(f"Patch S1 failed: {e}")
+        _log.warning(f"Patch PRIMARY failed: {e}")
 
-    # Strategy 2: Patch MultiModalRegistry.create_processor — skip for text-only models
+    # ------------------------------------------------------------------
+    # SAFETY NET: Patch MultiModalBudget to handle a None processor
+    # gracefully, in case any other code path still returns None.
+    # ------------------------------------------------------------------
     try:
-        from vllm.multimodal.registry import MultiModalRegistry
-        original_create = MultiModalRegistry.create_processor
+        from vllm.multimodal import encoder_budget as eb
 
-        def patched_create_processor(self, model_config, *args, **kwargs):
-            arch = getattr(model_config.hf_config, "architectures", [])
-            if arch == ["Qwen3_5ForCausalLM"]:
-                hf_cfg = model_config.hf_config
-                has_vision = (
-                    hasattr(hf_cfg, "vision_config") and
-                    hf_cfg.vision_config is not None
-                )
-                if not has_vision:
-                    _log.info(
-                        "Patch S2: skipping multimodal processor for "
-                        "text-only Qwen3_5ForCausalLM"
-                    )
-                    return None
-            return original_create(self, model_config, *args, **kwargs)
+        original_budget_init = eb.MultiModalBudget.__init__
 
-        MultiModalRegistry.create_processor = patched_create_processor
-        _log.info("Patch S2 applied: MultiModalRegistry.create_processor")
-    except Exception as e:
-        _log.warning(f"Patch S2 failed: {e}")
-
-    # Strategy 3: Patch BaseRenderer.__init__ — suppress mm_processor TypeError
-    try:
-        from vllm.renderers import base as renderer_base
-        original_renderer_init = renderer_base.BaseRenderer.__init__
-
-        def patched_renderer_init(self, config, tokenizer):
+        def patched_budget_init(self, vllm_config, mm_registry, **kwargs):
+            # Find the processor that would be used
             try:
-                original_renderer_init(self, config, tokenizer)
-            except TypeError as exc:
-                if "HuggingFace config" in str(exc) or "Qwen3_5" in str(exc):
-                    _log.warning(
-                        f"Patch S3: suppressed renderer mm_processor error: {exc}"
+                # Peek at what create_processor returns before calling original
+                model_config = vllm_config.model_config
+                processor = mm_registry.create_processor(model_config)
+                if processor is None:
+                    _log.info(
+                        "Patch BUDGET: mm processor is None (text-only model), "
+                        "initializing empty budget."
                     )
-                    self.mm_processor = None
+                    # Set up a no-op budget manually
+                    self.mm_limits = {}
+                    self.mm_budget = {}
+                    return
+            except Exception:
+                pass
+            original_budget_init(self, vllm_config, mm_registry, **kwargs)
+
+        eb.MultiModalBudget.__init__ = patched_budget_init
+        _log.info("Patch BUDGET applied: MultiModalBudget.__init__ (None-processor safe)")
+    except Exception as e:
+        _log.warning(f"Patch BUDGET failed: {e}")
+
+    # ------------------------------------------------------------------
+    # SAFETY NET 2: Patch InputProcessor to skip mm_budget if processor
+    # is None, preventing AttributeError: 'NoneType'.info
+    # ------------------------------------------------------------------
+    try:
+        from vllm.v1.engine import input_processor as ip
+
+        original_ip_init = ip.InputProcessor.__init__
+
+        def patched_ip_init(self, vllm_config, renderer, **kwargs):
+            try:
+                original_ip_init(self, vllm_config, renderer, **kwargs)
+            except AttributeError as e:
+                if "'NoneType' object has no attribute 'info'" in str(e) or \
+                   "supported_mm_limits" in str(e):
+                    _log.warning(
+                        f"Patch IP: suppressed InputProcessor mm_budget error: {e}. "
+                        "Setting empty mm_budget."
+                    )
+                    self.mm_budget = None
+                    self.mm_registry = None
                 else:
                     raise
 
-        renderer_base.BaseRenderer.__init__ = patched_renderer_init
-        _log.info("Patch S3 applied: BaseRenderer.__init__ (mm_processor error suppressed)")
+        ip.InputProcessor.__init__ = patched_ip_init
+        _log.info("Patch IP applied: InputProcessor.__init__ (None mm_budget safe)")
     except Exception as e:
-        _log.warning(f"Patch S3 failed: {e}")
+        _log.warning(f"Patch IP failed: {e}")
 
-    # Strategy 4: Patch Qwen3_5ModelInfo.get_hf_config directly if it exists
+    # ------------------------------------------------------------------
+    # SAFETY NET 3: Patch Qwen3_5ModelInfo.get_hf_config directly
+    # ------------------------------------------------------------------
     try:
         from vllm.model_executor.models import qwen3_5 as vllm_qwen35
         if hasattr(vllm_qwen35, "Qwen3_5ModelInfo"):
@@ -137,12 +163,12 @@ def _apply_vllm_qwen35_patch():
                 return self.ctx.model_config.hf_config
 
             ModelInfo.get_hf_config = patched_model_info_get_hf_config
-            _log.info("Patch S4 applied: Qwen3_5ModelInfo.get_hf_config")
+            _log.info("Patch MODEL_INFO applied: Qwen3_5ModelInfo.get_hf_config")
     except Exception as e:
-        _log.warning(f"Patch S4 failed: {e}")
+        _log.warning(f"Patch MODEL_INFO failed: {e}")
 
 
-# Apply ALL patches before any vLLM engine-related imports are used
+# Apply ALL patches before any vLLM engine is constructed
 _apply_vllm_qwen35_patch()
 
 # ---------------------------------------------------------------------------
@@ -202,8 +228,8 @@ def get_optimal_dtype():
 
 def _patch_model_config_on_disk(model_name: str):
     """
-    Belt-and-suspenders: ensure config.json has Qwen3_5ForCausalLM and
-    no VL-only keys that can trigger multimodal processor registration.
+    Ensure config.json on disk has Qwen3_5ForCausalLM and no VL-only keys.
+    Belt-and-suspenders alongside the runtime patches.
     """
     try:
         from huggingface_hub import snapshot_download, constants as hf_constants
@@ -231,9 +257,7 @@ def _patch_model_config_on_disk(model_name: str):
         target_arch = "Qwen3_5ForCausalLM"
 
         if config.get("architectures") != [target_arch]:
-            logger.info(
-                f"Disk patch: {config.get('architectures')} -> [{target_arch}]"
-            )
+            logger.info(f"Disk patch: {config.get('architectures')} -> [{target_arch}]")
             config["architectures"] = [target_arch]
             changed = True
 
@@ -275,7 +299,7 @@ def initialize():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     dtype = get_optimal_dtype()
 
-    # Belt-and-suspenders: patch the on-disk config too
+    # Belt-and-suspenders: also clean up the on-disk config
     _patch_model_config_on_disk(MODEL_NAME)
 
     llm_args = {
