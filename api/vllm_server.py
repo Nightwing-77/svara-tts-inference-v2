@@ -43,6 +43,10 @@ from vllm.lora.request import LoRARequest
 
 logger = logging.getLogger(__name__)
 
+# vLLM compatibility flags
+os.environ["VLLM_USE_V1"] = "0"  # Use v0 engine for better custom model support
+os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"  # Allow longer contexts
+
 MODEL_NAME = os.getenv("VLLM_MODEL", "kenpath/qwen3.5-0.8b-stage5")
 DEFAULT_SPEAKER_ID = os.getenv("SPEAKER_ID", "a1e51fd5")
 
@@ -102,12 +106,50 @@ def initialize():
     # Determine optimal dtype
     dtype = get_optimal_dtype()
 
+    # PATCH: Fix vLLM config class mismatch for Qwen3.5 models
+    # Strategy 1: Disable multimodal processing since this is text-only TTS
+    try:
+        from vllm.multimodal import MODELS as MM_MODELS
+        for key in list(MM_MODELS.keys()):
+            if 'qwen3' in key.lower():
+                del MM_MODELS[key]
+                logger.info(f"Removed {key} from multimodal registry")
+        os.environ["VLLM_DISABLE_MULTIMODAL"] = "1"
+    except Exception as e:
+        logger.warning(f"Could not disable multimodal: {e}")
+    
+    # Strategy 2: Override model architecture to generic LLM
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(MODEL_NAME, trust_remote_code=True)
+        # Force architecture to be text-only
+        if hasattr(config, 'architectures'):
+            config.architectures = ['LlamaForCausalLM']  # Generic architecture vLLM supports well
+        if hasattr(config, 'model_type'):
+            original_model_type = config.model_type
+            config.model_type = 'llama'  # Override model type
+            logger.info(f"Overrode model_type from {original_model_type} to 'llama'")
+        # Save to temp and use that
+        import tempfile
+        temp_dir = tempfile.mkdtemp()
+        config.save_pretrained(temp_dir)
+        os.environ["VLLM_CONFIG_PATH"] = temp_dir
+        logger.info(f"Saved patched config to {temp_dir}")
+    except Exception as e:
+        logger.warning(f"Could not override config: {e}")
+
     # vLLM engine with all optimizations
     # - Flash Attention: enabled by default
     # - PagedAttention: enabled by default  
     # - CUDA Graphs: enabled unless VLLM_ENFORCE_EAGER=true
+    
+    # Use temp config if we created one, otherwise use original model name
+    model_path = os.environ.get("VLLM_CONFIG_PATH", MODEL_NAME)
+    if model_path != MODEL_NAME:
+        logger.info(f"Using patched config from {model_path}")
+    
     llm_args = {
-        "model": MODEL_NAME,
+        "model": model_path,
         "tokenizer": MODEL_NAME,
         "dtype": dtype,
         "gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
