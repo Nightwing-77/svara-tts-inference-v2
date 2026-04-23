@@ -155,17 +155,49 @@ def _apply_vllm_qwen35_patch():
             ModelInfo = vllm_qwen35.Qwen3_5ModelInfo
 
             def patched_model_info_get_hf_config(self, config_cls=None):
-                try:
-                    if config_cls is not None:
-                        return self.ctx.get_hf_config(config_cls)
-                except TypeError:
-                    pass
+                # Bypass ctx.get_hf_config which does strict type checking
+                # Just return the hf_config directly from model_config
                 return self.ctx.model_config.hf_config
 
             ModelInfo.get_hf_config = patched_model_info_get_hf_config
             _log.info("Patch MODEL_INFO applied: Qwen3_5ModelInfo.get_hf_config")
     except Exception as e:
         _log.warning(f"Patch MODEL_INFO failed: {e}")
+
+    # ------------------------------------------------------------------
+    # SAFETY NET 4: Patch Qwen3_5MultiModalProcessor which is the actual source
+    # ------------------------------------------------------------------
+    try:
+        from vllm.model_executor.models import qwen3_5 as vllm_qwen35
+        if hasattr(vllm_qwen35, "Qwen3_5MultiModalProcessor"):
+            Processor = vllm_qwen35.Qwen3_5MultiModalProcessor
+
+            def patched_processor_get_hf_config(self, config_cls=None):
+                # Direct access to hf_config, bypassing type check
+                return self.ctx.model_config.hf_config
+
+            Processor.get_hf_config = patched_processor_get_hf_config
+            _log.info("Patch PROCESSOR applied: Qwen3_5MultiModalProcessor.get_hf_config")
+    except Exception as e:
+        _log.warning(f"Patch PROCESSOR failed: {e}")
+
+    # ------------------------------------------------------------------
+    # SAFETY NET 5: Patch get_data_parser which calls get_hf_config
+    # ------------------------------------------------------------------
+    try:
+        from vllm.model_executor.models import qwen3_5 as vllm_qwen35
+        if hasattr(vllm_qwen35, "Qwen3_5MultiModalProcessor"):
+            Processor = vllm_qwen35.Qwen3_5MultiModalProcessor
+
+            def patched_get_data_parser(self):
+                # Return a dummy data parser instead of using vision_config
+                from vllm.multimodal.processing.common import MultiModalDataParser
+                return MultiModalDataParser()
+
+            Processor.get_data_parser = patched_get_data_parser
+            _log.info("Patch DATA_PARSER applied: Qwen3_5MultiModalProcessor.get_data_parser")
+    except Exception as e:
+        _log.warning(f"Patch DATA_PARSER failed: {e}")
 
 
 # Apply ALL patches before any vLLM engine is constructed
