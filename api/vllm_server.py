@@ -11,6 +11,7 @@ import logging
 import base64
 import time
 import io
+import json
 from pathlib import Path
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -50,8 +51,6 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"  # More compatible process 
 
 MODEL_NAME = os.getenv("VLLM_MODEL", "kenpath/qwen3.5-0.8b-stage5")
 
-# vLLM environment setup complete
-
 DEFAULT_SPEAKER_ID = os.getenv("SPEAKER_ID", "a1e51fd5")
 
 # vLLM specific configuration
@@ -78,16 +77,82 @@ def get_optimal_dtype():
     """Determine optimal dtype based on GPU capabilities."""
     if VLLM_DTYPE != "auto":
         return VLLM_DTYPE
-    
+
     if torch.cuda.is_available():
         # Check for Ampere or newer (SM80+) for bfloat16 support
         major, minor = torch.cuda.get_device_capability()
         if major >= 8:  # A100, H100, RTX 3090, RTX 4090, etc.
             logger.info("Using bfloat16 (optimal for Ampere/Hopper GPUs)")
             return "bfloat16"
-    
+
     logger.info("Using float16")
     return "float16"
+
+
+def _patch_model_config_for_vllm(model_name: str):
+    """
+    Force the model architecture to Qwen3_5ForCausalLM so vLLM does not
+    route it through the multimodal (VL) pipeline.
+
+    Strategy: find the cached config.json on disk and rewrite 'architectures'
+    in-place before vLLM reads it. vLLM reads config.json first to decide
+    which model class to register — changing 'architectures' here stops the
+    VL pipeline (and its strict Qwen3_5Config vs Qwen3_5TextConfig check)
+    from ever being activated.
+    """
+    try:
+        from huggingface_hub import snapshot_download, constants as hf_constants
+
+        # If it's a local directory, use it directly
+        model_path = Path(model_name)
+        if not model_path.exists():
+            # It's a Hub model ID — find or download the cached snapshot
+            cache_dir = hf_constants.HF_HUB_CACHE
+            model_path = Path(
+                snapshot_download(
+                    model_name,
+                    local_files_only=False,
+                    cache_dir=cache_dir,
+                )
+            )
+
+        config_path = model_path / "config.json"
+        if not config_path.exists():
+            logger.warning(f"config.json not found at {config_path}, skipping patch")
+            return
+
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        arch = config.get("architectures", [])
+        target_arch = "Qwen3_5ForCausalLM"
+
+        if arch == [target_arch]:
+            logger.info(f"Architecture already set to {target_arch}, no patch needed")
+            return
+
+        logger.info(f"Patching architecture: {arch} -> [{target_arch}]")
+        config["architectures"] = [target_arch]
+
+        # Remove any vision/audio keys that trigger the VL pipeline processor
+        for vl_key in ("vision_config", "audio_config", "mm_resampler_type"):
+            if vl_key in config:
+                logger.info(f"Removing VL config key: {vl_key}")
+                config.pop(vl_key)
+
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+
+        logger.info(f"Successfully patched {config_path}")
+
+    except Exception as e:
+        logger.error(f"Could not patch model config: {e}")
+        raise RuntimeError(
+            "Failed to patch model config. vLLM will try to load the VL pipeline "
+            "and fail with: TypeError: Invalid type of HuggingFace config. "
+            "Fix manually by setting architectures=[\"Qwen3_5ForCausalLM\"] "
+            f"in the model's config.json at {model_name}"
+        ) from e
 
 
 def initialize():
@@ -110,39 +175,19 @@ def initialize():
     # Determine optimal dtype
     dtype = get_optimal_dtype()
 
-    # PATCH: Fix vLLM architecture mismatch for Qwen3.5 models
-    # The model reports Qwen3_5ForCausalLM but vLLM expects Qwen3_5ForConditionalGeneration
-    try:
-        # Patch 2a: Override vLLM's config loading
-        from transformers import AutoConfig
-        import vllm.transformers_utils.config as vllm_config_module
-        
-        original_load_config = vllm_config_module.get_config
-        
-        def patched_load_config(model, **kwargs):
-            config = AutoConfig.from_pretrained(model, trust_remote_code=True)
-            # Check if this is a Qwen3.5 model that needs patching
-            if hasattr(config, 'architectures'):
-                arch = config.architectures[0] if config.architectures else None
-                if arch and 'Qwen3_5ForCausalLM' in arch:
-                    # vLLM supports Qwen3_5ForConditionalGeneration, not Qwen3_5ForCausalLM
-                    logger.info(f"Patching architecture: {arch} -> Qwen3_5ForConditionalGeneration")
-                    config.architectures = ['Qwen3_5ForConditionalGeneration']
-            return config
-        
-        vllm_config_module.get_config = patched_load_config
-        logger.info("Applied vLLM config loading patch")
-        
-    except Exception as e:
-        logger.warning(f"Could not apply config patch: {e}")
-        import traceback
-        logger.warning(traceback.format_exc())
+    # PATCH: Force text-only architecture BEFORE vLLM reads config.json.
+    # This prevents vLLM from routing the model through the multimodal VL
+    # pipeline, which causes:
+    #   TypeError: Invalid type of HuggingFace config.
+    #   Expected: Qwen3_5Config, but found: Qwen3_5TextConfig
+    _patch_model_config_for_vllm(MODEL_NAME)
 
     # vLLM engine with all optimizations
     # - Flash Attention: enabled by default
-    # - PagedAttention: enabled by default  
+    # - PagedAttention: enabled by default
     # - CUDA Graphs: enabled unless VLLM_ENFORCE_EAGER=true
-    
+    # - Continuous batching: handled automatically by vLLM
+
     llm_args = {
         "model": MODEL_NAME,
         "tokenizer": MODEL_NAME,
@@ -170,7 +215,7 @@ def initialize():
 
     # Load NeuCodec and move to same device as vLLM
     codec = NeuCodec.from_pretrained("neuphonic/neucodec")
-    
+
     # Move codec to appropriate device
     if torch.cuda.is_available():
         codec = codec.cuda()
@@ -178,14 +223,14 @@ def initialize():
         # Enable TF32 for faster matmuls on Ampere+
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        
+
         # Compile the decode function for faster audio generation
         try:
             logger.info("Compiling NeuCodec decoder with torch.compile...")
             codec.decode_code = torch.compile(
-                codec.decode_code, 
+                codec.decode_code,
                 mode="max-autotune",
-                fullgraph=False
+                fullgraph=False,
             )
         except Exception as e:
             logger.warning(f"Could not compile codec (requires PyTorch 2.0+): {e}")
@@ -238,7 +283,7 @@ def generate_tts_vllm(
 
     # Generate with vLLM (much faster than Transformers)
     outputs = llm.generate(prompt, sampling_params)
-    
+
     # Extract generated text
     generated_text = outputs[0].outputs[0].text
     full_decoded = prompt + generated_text
@@ -302,7 +347,7 @@ def generate_tts_with_timing_vllm(
 
     # Generate with vLLM
     outputs = llm.generate(prompt, sampling_params)
-    
+
     # TTFB measurement - vLLM returns full output so we approximate
     # based on first token generation time internally
     first_token_time = time.time()
@@ -311,7 +356,7 @@ def generate_tts_with_timing_vllm(
     # Extract generated text
     generated_text = outputs[0].outputs[0].text
     full_decoded = prompt + generated_text
-    
+
     # Get token count from output
     output_tokens = outputs[0].outputs[0].token_ids
     metrics["tokens_generated"] = len(output_tokens)
@@ -349,13 +394,13 @@ def decode_single_chunk(token_ids: list[int]) -> np.ndarray:
     """Decode a single chunk of codec tokens to audio array."""
     if not token_ids:
         return np.array([], dtype=np.float32)
-    
+
     codec_tokens = torch.tensor(token_ids, dtype=torch.long, device=codec.device)
     codec_tokens = codec_tokens.unsqueeze(0).unsqueeze(1)
-    
+
     with torch.no_grad():
         audio = codec.decode_code(codec_tokens)
-    
+
     return audio.squeeze().cpu().numpy()
 
 
@@ -396,13 +441,13 @@ def generate_tts_concurrent(
 
     # Generate all tokens with vLLM (fast)
     outputs = llm.generate(prompt, sampling_params)
-    
+
     first_token_time = time.time()
     metrics["ttfb_ms"] = round((first_token_time - metrics["start_time"]) * 1000, 2)
 
     generated_text = outputs[0].outputs[0].text
     full_decoded = prompt + generated_text
-    
+
     output_tokens = outputs[0].outputs[0].token_ids
     metrics["tokens_generated"] = len(output_tokens)
 
@@ -418,7 +463,7 @@ def generate_tts_concurrent(
     chunk_size = CODEC_WINDOW_SIZE
     overlap = 4
     chunks = []
-    
+
     for i in range(0, len(ids), chunk_size - overlap):
         chunk = ids[i:i + chunk_size]
         if len(chunk) >= 8:  # Minimum viable chunk
@@ -426,7 +471,7 @@ def generate_tts_concurrent(
 
     # Decode chunks concurrently using thread pool
     audio_chunks = list(decoder_executor.map(decode_single_chunk, chunks))
-    
+
     # Concatenate audio chunks (simple concatenation, could add crossfade)
     full_audio = np.concatenate([c for c in audio_chunks if len(c) > 0])
 
@@ -458,7 +503,7 @@ def generate_tts_batch(
         raise RuntimeError("Model not initialized")
 
     prompts = [format_tts_prompt(t, speaker_id) for t in texts]
-    
+
     sampling_params = SamplingParams(
         max_tokens=max_new_tokens,
         min_tokens=10,
@@ -478,20 +523,20 @@ def generate_tts_batch(
         generated = output.outputs[0].text
         full = prompts[i] + generated
         ids = extract_codec_tokens(full)
-        
+
         if ids:
             codec_tokens = torch.tensor(ids, dtype=torch.long, device=codec.device)
             codec_tokens = codec_tokens.unsqueeze(0).unsqueeze(1)
-            
+
             with torch.no_grad():
                 audio = codec.decode_code(codec_tokens)
-            
+
             audio_np = audio.squeeze().cpu().numpy()
-            
+
             buf = io.BytesIO()
             sf.write(buf, audio_np, samplerate=24000, format="WAV")
             buf.seek(0)
-            
+
             metrics = {
                 "batch_time_ms": round(batch_time * 1000, 2),
                 "tokens_generated": len(ids),
@@ -500,7 +545,7 @@ def generate_tts_batch(
             results.append((buf.read(), metrics))
         else:
             results.append((b"", {"error": "No tokens generated"}))
-    
+
     return results
 
 
@@ -700,7 +745,7 @@ async def benchmark_info():
             "flash_attention": "2-3x memory efficiency + speedup",
             "cuda_graphs": "10-20% latency reduction",
             "bfloat16": "Same speed, better stability on Ampere+",
-        }
+        },
     }
 
 
