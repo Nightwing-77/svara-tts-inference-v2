@@ -50,21 +50,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"  # More compatible process 
 
 MODEL_NAME = os.getenv("VLLM_MODEL", "kenpath/qwen3.5-0.8b-stage5")
 
-# CRITICAL: Apply patches BEFORE importing vLLM modules
-# This prevents Qwen3.5 model class registration
-try:
-    # Pre-patch: Remove Qwen3.5 from multimodal registry before it's imported
-    import sys
-    
-    # Create a fake empty module to prevent Qwen3.5 model loading
-    class FakeModule:
-        pass
-    
-    # Pre-emptively block Qwen3.5 models
-    sys.modules['vllm.model_executor.models.qwen3_5'] = FakeModule()
-    logger.info("Pre-blocked qwen3_5 module loading")
-except Exception as e:
-    logger.warning(f"Could not pre-patch: {e}")
+# vLLM environment setup complete
 
 DEFAULT_SPEAKER_ID = os.getenv("SPEAKER_ID", "a1e51fd5")
 
@@ -124,19 +110,8 @@ def initialize():
     # Determine optimal dtype
     dtype = get_optimal_dtype()
 
-    # PATCH: Fix vLLM config class mismatch for Qwen3.5 models
-    # Strategy 1: Disable multimodal processing since this is text-only TTS
-    try:
-        from vllm.multimodal import MODELS as MM_MODELS
-        for key in list(MM_MODELS.keys()):
-            if 'qwen3' in key.lower():
-                del MM_MODELS[key]
-                logger.info(f"Removed {key} from multimodal registry")
-        os.environ["VLLM_DISABLE_MULTIMODAL"] = "1"
-    except Exception as e:
-        logger.warning(f"Could not disable multimodal: {e}")
-    
-    # Strategy 2: Aggressive patch for vLLM Qwen3.5 model compatibility
+    # PATCH: Fix vLLM architecture mismatch for Qwen3.5 models
+    # The model reports Qwen3_5ForCausalLM but vLLM expects Qwen3_5ForConditionalGeneration
     try:
         # Patch 2a: Override vLLM's config loading
         from transformers import AutoConfig
@@ -146,34 +121,20 @@ def initialize():
         
         def patched_load_config(model, **kwargs):
             config = AutoConfig.from_pretrained(model, trust_remote_code=True)
-            if hasattr(config, 'model_type') and 'qwen3' in config.model_type.lower():
-                logger.info(f"Patching config: {config.model_type} -> llama")
-                if hasattr(config, 'architectures'):
-                    config.architectures = ['LlamaForCausalLM']
-                config.model_type = 'llama'
-                config._original_model_type = 'qwen3.5'
+            # Check if this is a Qwen3.5 model that needs patching
+            if hasattr(config, 'architectures'):
+                arch = config.architectures[0] if config.architectures else None
+                if arch and 'Qwen3_5ForCausalLM' in arch:
+                    # vLLM supports Qwen3_5ForConditionalGeneration, not Qwen3_5ForCausalLM
+                    logger.info(f"Patching architecture: {arch} -> Qwen3_5ForConditionalGeneration")
+                    config.architectures = ['Qwen3_5ForConditionalGeneration']
             return config
         
         vllm_config_module.get_config = patched_load_config
         logger.info("Applied vLLM config loading patch")
         
-        # Patch 2b: Remove Qwen3.5 from model registry to force Llama fallback
-        from vllm.model_executor.models import ModelRegistry
-        
-        # Unregister Qwen3.5 models to force generic handling
-        models_to_remove = []
-        for key in list(ModelRegistry._model_mapping.keys()):
-            if 'qwen3' in key.lower():
-                models_to_remove.append(key)
-        
-        for key in models_to_remove:
-            del ModelRegistry._model_mapping[key]
-            logger.info(f"Removed {key} from ModelRegistry")
-        
-        logger.info("Applied ModelRegistry patch")
-        
     except Exception as e:
-        logger.warning(f"Could not apply config patches: {e}")
+        logger.warning(f"Could not apply config patch: {e}")
         import traceback
         logger.warning(traceback.format_exc())
 
